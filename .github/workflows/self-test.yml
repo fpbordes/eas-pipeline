@@ -1,0 +1,27 @@
+# Exercises the reusable workflow in dry run on every push, with no secret: the syntax, the
+# job graph and the result files are checked here before any app depends on a change.
+name: Self-test (dry run)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  update:
+    uses: ./.github/workflows/eas.yml
+    with:
+      app_name: demo
+      mode: update
+      dry_run: true
+
+  release:
+    uses: ./.github/workflows/eas.yml
+    with:
+      app_name: demo
+      mode: release
+      profile: demo-production
+      asc_api_key_path: ./.secrets/AuthKey_DEMO.p8
+      google_service_account_key_path: ./.secrets/google-play.json
+      dry_run: true

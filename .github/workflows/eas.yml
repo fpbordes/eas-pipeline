@@ -1,0 +1,290 @@
+# One reusable pipeline for every Expo app built with EAS (Expo Application Services).
+#
+# A caller names the app it builds, the EAS profile of that app (eas.json) and what it wants:
+#   mode: update   — publish the JavaScript of the current commit as an EAS Update, to the channel
+#                    of the profile. The app on a phone picks it up at its next start. No store
+#                    review, no new binary. The right thing on every push to main.
+#   mode: build    — build the iOS and Android binaries in parallel (store distribution), and
+#                    leave a latest.json naming both builds. For a binary to test by hand.
+#   mode: release  — build, wait for both binaries, then submit each to its store (App Store
+#                    Connect, Google Play) with the submit profile of eas.json. One tag, one release.
+#
+# This workflow lives in a public repository on purpose: GitHub lets a private repository call a
+# reusable workflow only from repositories of the same owner, and the apps that call this one
+# belong to several owners. The callers map their own brand-prefixed secrets onto the generic
+# names declared below, because the `secrets` context cannot be indexed by a variable.
+#
+# A missing EAS_TOKEN switches every step to dry run: the caller can be wired before an app's
+# EAS project, Apple Developer or Google Play account exist, and the logs say what would run.
+#
+# Each platform job writes a result file of its own and uploads it as an artifact; a last job,
+# gated on both, composes latest.json once. No job ever reads and rewrites a manifest another
+# job may be writing (the race that lost a platform entry in a desktop release pipeline).
+
+name: EAS (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: "App or brand identifier the caller builds (e.g. wesmart, belvus, ekwo). Names artifacts and log lines; never a default."
+        required: true
+        type: string
+      mode:
+        description: "update (EAS Update to the profile's channel), build (binaries), or release (binaries, then store submission)."
+        required: false
+        type: string
+        default: update
+      profile:
+        description: "EAS build profile of the caller's eas.json. An app that ships several brands names one per brand (e.g. belvus-production)."
+        required: false
+        type: string
+        default: production
+      submit_profile:
+        description: "EAS submit profile of the caller's eas.json, for mode release. Defaults to the build profile's name."
+        required: false
+        type: string
+        default: ""
+      channel:
+        description: "EAS Update channel, for mode update. Defaults to the profile's name, which is how eas.json usually names channels."
+        required: false
+        type: string
+        default: ""
+      asc_api_key_path:
+        description: "Where the caller's eas.json expects the App Store Connect API key file (ascApiKeyPath), for mode release. Written from the secret ASC_API_KEY_P8."
+        required: false
+        type: string
+        default: ""
+      google_service_account_key_path:
+        description: "Where the caller's eas.json expects the Google Play service-account JSON (serviceAccountKeyPath), for mode release. Written from the secret GOOGLE_SERVICE_ACCOUNT_KEY."
+        required: false
+        type: string
+        default: ""
+      node_version:
+        description: "Node.js version to install."
+        required: false
+        type: string
+        default: "20"
+      dry_run:
+        description: "Print the eas commands instead of running them."
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      EAS_TOKEN:
+        description: "Expo access token (EXPO_TOKEN) for non-interactive eas commands. Its absence switches the run to dry run."
+        required: false
+      EXPO_APPLE_TEAM_ID:
+        description: "Apple Developer team id EAS signs iOS builds with."
+        required: false
+      EXPO_APPLE_APP_SPECIFIC_PASSWORD:
+        description: "App-specific password of the Apple account EAS authenticates as, when the submit profile uses an Apple ID."
+        required: false
+      ASC_API_KEY_P8:
+        description: "Contents of the App Store Connect API key (.p8), when the submit profile uses an API key (ascApiKeyPath)."
+        required: false
+      GOOGLE_SERVICE_ACCOUNT_KEY:
+        description: "Google Play service-account key (JSON), for Android credentials and submission."
+        required: false
+
+jobs:
+  update:
+    name: EAS Update (${{ inputs.app_name }})
+    if: inputs.mode == 'update'
+    runs-on: ubuntu-latest
+    env:
+      EAS_DRY_RUN: ${{ (inputs.dry_run || secrets.EAS_TOKEN == '') && 'true' || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+      - name: Install dependencies
+        if: hashFiles('package-lock.json') != ''
+        run: npm ci
+      - name: Install EAS CLI
+        run: npm install -g eas-cli
+      - name: Publish the update
+        env:
+          EXPO_TOKEN: ${{ secrets.EAS_TOKEN }}
+          APP_NAME: ${{ inputs.app_name }}
+          CHANNEL: ${{ inputs.channel != '' && inputs.channel || inputs.profile }}
+        run: |
+          set -euo pipefail
+          cmd=(eas update --channel "$CHANNEL" --auto --non-interactive)
+          if [ "$EAS_DRY_RUN" = "true" ]; then
+            echo "[dry run] would run: ${cmd[*]} (app=$APP_NAME)"
+          else
+            "${cmd[@]}"
+          fi
+
+  build-ios:
+    name: Build iOS (${{ inputs.app_name }})
+    if: inputs.mode == 'build' || inputs.mode == 'release'
+    runs-on: ubuntu-latest
+    env:
+      EAS_DRY_RUN: ${{ (inputs.dry_run || secrets.EAS_TOKEN == '') && 'true' || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+      - name: Install dependencies
+        if: hashFiles('package-lock.json') != ''
+        run: npm ci
+      - name: Install EAS CLI
+        run: npm install -g eas-cli
+      - name: Build iOS
+        env:
+          EXPO_TOKEN: ${{ secrets.EAS_TOKEN }}
+          EXPO_APPLE_TEAM_ID: ${{ secrets.EXPO_APPLE_TEAM_ID }}
+          EXPO_APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.EXPO_APPLE_APP_SPECIFIC_PASSWORD }}
+          APP_NAME: ${{ inputs.app_name }}
+          EAS_PROFILE: ${{ inputs.profile }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          mkdir -p .eas-entries
+          wait_flag=--no-wait; [ "$MODE" = "release" ] && wait_flag=--wait
+          if [ "$EAS_DRY_RUN" = "true" ]; then
+            echo "[dry run] would run: eas build --non-interactive --platform ios --profile $EAS_PROFILE $wait_flag (app=$APP_NAME)"
+            node -e 'require("fs").writeFileSync(".eas-entries/ios.json", JSON.stringify({ platform: "ios", app: process.env.APP_NAME, profile: process.env.EAS_PROFILE, status: "dry-run", buildId: null, url: null }, null, 2))'
+          else
+            eas build --non-interactive --platform ios --profile "$EAS_PROFILE" --json "$wait_flag" > .eas-entries/ios-raw.json
+            node -e '
+              const fs = require("fs");
+              const raw = JSON.parse(fs.readFileSync(".eas-entries/ios-raw.json", "utf8"));
+              const build = Array.isArray(raw) ? raw[0] : raw;
+              fs.writeFileSync(".eas-entries/ios.json", JSON.stringify({ platform: "ios", app: process.env.APP_NAME, profile: process.env.EAS_PROFILE, status: build.status ?? "unknown", buildId: build.id ?? null, url: build.artifacts?.buildUrl ?? null }, null, 2));
+            '
+          fi
+      - name: Submit to App Store Connect
+        if: inputs.mode == 'release'
+        env:
+          EXPO_TOKEN: ${{ secrets.EAS_TOKEN }}
+          EXPO_APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.EXPO_APPLE_APP_SPECIFIC_PASSWORD }}
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+          ASC_API_KEY_PATH: ${{ inputs.asc_api_key_path }}
+          SUBMIT_PROFILE: ${{ inputs.submit_profile != '' && inputs.submit_profile || inputs.profile }}
+          APP_NAME: ${{ inputs.app_name }}
+        run: |
+          set -euo pipefail
+          if [ -n "$ASC_API_KEY_PATH" ] && [ -n "$ASC_API_KEY_P8" ]; then
+            mkdir -p "$(dirname "$ASC_API_KEY_PATH")"; printf '%s' "$ASC_API_KEY_P8" > "$ASC_API_KEY_PATH"
+          fi
+          id=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(".eas-entries/ios.json","utf8")).buildId ?? "")')
+          if [ "$EAS_DRY_RUN" = "true" ] || [ -z "$id" ]; then
+            echo "[dry run] would run: eas submit --platform ios --profile $SUBMIT_PROFILE --id <build id> --non-interactive (app=$APP_NAME)"
+          else
+            eas submit --platform ios --profile "$SUBMIT_PROFILE" --id "$id" --non-interactive
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eas-entry-ios
+          path: .eas-entries/ios.json
+          retention-days: 7
+
+  build-android:
+    name: Build Android (${{ inputs.app_name }})
+    if: inputs.mode == 'build' || inputs.mode == 'release'
+    runs-on: ubuntu-latest
+    env:
+      EAS_DRY_RUN: ${{ (inputs.dry_run || secrets.EAS_TOKEN == '') && 'true' || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+      - name: Install dependencies
+        if: hashFiles('package-lock.json') != ''
+        run: npm ci
+      - name: Install EAS CLI
+        run: npm install -g eas-cli
+      - name: Write the Google Play service-account key
+        if: inputs.google_service_account_key_path != ''
+        env:
+          GOOGLE_SERVICE_ACCOUNT_KEY: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY }}
+          KEY_PATH: ${{ inputs.google_service_account_key_path }}
+        run: |
+          set -euo pipefail
+          if [ -n "$GOOGLE_SERVICE_ACCOUNT_KEY" ]; then
+            mkdir -p "$(dirname "$KEY_PATH")"; printf '%s' "$GOOGLE_SERVICE_ACCOUNT_KEY" > "$KEY_PATH"
+          fi
+      - name: Build Android
+        env:
+          EXPO_TOKEN: ${{ secrets.EAS_TOKEN }}
+          APP_NAME: ${{ inputs.app_name }}
+          EAS_PROFILE: ${{ inputs.profile }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          mkdir -p .eas-entries
+          wait_flag=--no-wait; [ "$MODE" = "release" ] && wait_flag=--wait
+          if [ "$EAS_DRY_RUN" = "true" ]; then
+            echo "[dry run] would run: eas build --non-interactive --platform android --profile $EAS_PROFILE $wait_flag (app=$APP_NAME)"
+            node -e 'require("fs").writeFileSync(".eas-entries/android.json", JSON.stringify({ platform: "android", app: process.env.APP_NAME, profile: process.env.EAS_PROFILE, status: "dry-run", buildId: null, url: null }, null, 2))'
+          else
+            eas build --non-interactive --platform android --profile "$EAS_PROFILE" --json "$wait_flag" > .eas-entries/android-raw.json
+            node -e '
+              const fs = require("fs");
+              const raw = JSON.parse(fs.readFileSync(".eas-entries/android-raw.json", "utf8"));
+              const build = Array.isArray(raw) ? raw[0] : raw;
+              fs.writeFileSync(".eas-entries/android.json", JSON.stringify({ platform: "android", app: process.env.APP_NAME, profile: process.env.EAS_PROFILE, status: build.status ?? "unknown", buildId: build.id ?? null, url: build.artifacts?.buildUrl ?? null }, null, 2));
+            '
+          fi
+      - name: Submit to Google Play
+        if: inputs.mode == 'release'
+        env:
+          EXPO_TOKEN: ${{ secrets.EAS_TOKEN }}
+          SUBMIT_PROFILE: ${{ inputs.submit_profile != '' && inputs.submit_profile || inputs.profile }}
+          APP_NAME: ${{ inputs.app_name }}
+        run: |
+          set -euo pipefail
+          id=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(".eas-entries/android.json","utf8")).buildId ?? "")')
+          if [ "$EAS_DRY_RUN" = "true" ] || [ -z "$id" ]; then
+            echo "[dry run] would run: eas submit --platform android --profile $SUBMIT_PROFILE --id <build id> --non-interactive (app=$APP_NAME)"
+          else
+            eas submit --platform android --profile "$SUBMIT_PROFILE" --id "$id" --non-interactive
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eas-entry-android
+          path: .eas-entries/android.json
+          retention-days: 7
+
+  compose-latest:
+    name: Compose latest.json (${{ inputs.app_name }})
+    needs: [build-ios, build-android]
+    if: always() && (inputs.mode == 'build' || inputs.mode == 'release')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: eas-entry-*
+          path: entries
+          merge-multiple: true
+      - name: Compose latest.json from every platform entry
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs"), path = require("path");
+            const dir = "entries";
+            const files = fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.endsWith(".json")) : [];
+            if (files.length === 0) { console.error("No platform entry was found: both build jobs failed before writing theirs."); process.exit(1); }
+            const platforms = {};
+            for (const file of files) {
+              const e = JSON.parse(fs.readFileSync(path.join(dir, file), "utf8"));
+              platforms[e.platform] = { profile: e.profile ?? null, status: e.status, buildId: e.buildId, url: e.url };
+            }
+            const latest = { app: process.env.APP_NAME, mode: process.env.MODE, pub_date: new Date().toISOString(), platforms };
+            fs.writeFileSync("latest.json", JSON.stringify(latest, null, 2) + "\n");
+            console.log("latest.json:", JSON.stringify(latest));
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eas-latest-${{ inputs.app_name }}
+          path: latest.json
+          retention-days: 30
